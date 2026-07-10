@@ -1,0 +1,24 @@
+# ============================================================
+# Transcrição de Áudio - dependências de execução (CPU)
+# ============================================================
+# Instalação:
+#     python -m venv venv
+#     venv\Scripts\activate
+#     pip install -r requirements.txt
+#
+# Estes pacotes já bastam para rodar 100% offline na CPU.
+# faster-whisper puxa automaticamente: ctranslate2, av, onnxruntime,
+# tokenizers e huggingface_hub.
+#
+# Para acelerar com GPU NVIDIA (opcional), instale também:
+#     pip install -r requirements-gpu.txt
+# ------------------------------------------------------------
+
+# Núcleo de transcrição local/offline (Whisper via CTranslate2)
+faster-whisper==1.2.1
+
+# Captura de áudio: microfone + WASAPI loopback (áudio do sistema)
+PyAudioWPatch==0.2.12.8
+
+# Processamento de áudio (conversão/reamostragem)
+numpy==2.5.1

@@ -1,0 +1,19 @@
+# Ambiente virtual
+venv/
+.venv/
+
+# Artefatos de build do PyInstaller
+build/
+dist/
+*.manifest
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs
+*.log
+
+# Modelos baixados (ficam no cache do usuário, não no projeto)
+models/
