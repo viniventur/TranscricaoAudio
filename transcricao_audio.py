@@ -26,10 +26,13 @@ if sys.stderr is None:
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
+import io
 import json
 import queue
 import threading
+import time
 import traceback
+import wave
 from datetime import datetime
 
 import tkinter as tk
@@ -44,11 +47,28 @@ import pyaudiowpatch as pyaudio
 # ---------------------------------------------------------------------------
 APP_TITLE = "Transcrição de Áudio"
 TARGET_RATE = 16000
-BLOCK_SECONDS = 5.0
 READ_CHUNK = 1024
-MODELS = ["tiny", "base", "small", "medium"]
+CAPTURE_SECONDS = 1.0          # a captura entrega blocos curtos de ~1s...
+# ...e a transcrição os acumula e só corta em PAUSAS (silêncio) ou no tamanho
+# máximo, o que melhora MUITO a precisão vs. cortes fixos "no seco".
+MIN_FLUSH_SECONDS = 5.0
+MAX_FLUSH_SECONDS = 15.0
+SILENCE_RMS = 0.012            # abaixo disso o trecho é considerado "pausa"
+CONTEXT_TAIL_CHARS = 220       # contexto passado ao modelo entre blocos
+MAX_BACKLOG_SECONDS = 90       # teto da fila; acima disso descarta o mais antigo
+
+# Modelos locais (faster-whisper). 'large-v3-turbo' = quase a qualidade do
+# large-v3 com muito mais velocidade (ótimo com GPU).
+MODELS = ["tiny", "base", "small", "medium", "large-v3-turbo", "large-v3"]
 DEFAULT_MODEL = "small"
 LANGUAGE = "pt"
+
+# Motores de transcrição
+ENGINE_LOCAL = "local"
+ENGINE_OPENAI = "openai"
+OPENAI_MODELS = ["gpt-4o-mini-transcribe", "gpt-4o-transcribe", "whisper-1"]
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini-transcribe"
+OPENAI_URL = "https://api.openai.com/v1/audio/transcriptions"
 
 MODE_MIC = "mic"
 MODE_SYS = "sys"
@@ -172,6 +192,41 @@ def int16_bytes_to_mono_f32(raw, channels):
     return data.astype(np.float32, copy=False)
 
 
+def rms(audio):
+    """Raiz média quadrática (volume) de um sinal float32; 0 se vazio."""
+    if audio is None or audio.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))))
+
+
+def float32_to_wav_bytes(audio16k):
+    """Empacota um sinal float32 mono 16 kHz em bytes de um WAV PCM16."""
+    pcm = np.clip(audio16k, -1.0, 1.0)
+    pcm = (pcm * 32767.0).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(TARGET_RATE)
+        wf.writeframes(pcm.tobytes())
+    return buf.getvalue()
+
+
+def openai_transcribe(audio16k, api_key, model, prompt=""):
+    """Transcreve um bloco pela API da OpenAI. Requer chave. Levanta em erro."""
+    import httpx
+    wav = float32_to_wav_bytes(audio16k)
+    data = {"model": model, "language": LANGUAGE, "response_format": "text",
+            "temperature": "0"}
+    if prompt:
+        data["prompt"] = prompt[-1000:]
+    files = {"file": ("audio.wav", wav, "audio/wav")}
+    r = httpx.post(OPENAI_URL, headers={"Authorization": f"Bearer {api_key}"},
+                   data=data, files=files, timeout=120.0)
+    r.raise_for_status()
+    return r.text.strip()
+
+
 def add_cuda_dll_dirs():
     if os.name != "nt":
         return
@@ -282,7 +337,7 @@ class CaptureThread(threading.Thread):
             self.error_cb(f"Não foi possível abrir o dispositivo de áudio:\n{e}")
             return
 
-        frames_needed = int(self.rate * BLOCK_SECONDS)
+        frames_needed = int(self.rate * CAPTURE_SECONDS)
         parts, collected, errors = [], 0, 0
         try:
             while not self.stop_event.is_set():
@@ -425,6 +480,19 @@ class TranscricaoApp:
         self.running = False
         self._mic_map = {}
         self._sys_map = {}
+        self._context_tail = ""
+
+        # Motor / OpenAI / vocabulário (carregados da config)
+        self.engine = self.cfg.get("engine", ENGINE_LOCAL)
+        if self.engine not in (ENGINE_LOCAL, ENGINE_OPENAI):
+            self.engine = ENGINE_LOCAL
+        # Coage para str: uma config editada à mão pode ter tipos errados
+        # (número/None), o que quebraria .strip() e travaria o worker.
+        self.openai_key = str(self.cfg.get("openai_key", "") or "")
+        self.openai_model = str(self.cfg.get("openai_model", DEFAULT_OPENAI_MODEL))
+        if self.openai_model not in OPENAI_MODELS:
+            self.openai_model = DEFAULT_OPENAI_MODEL
+        self.vocab = str(self.cfg.get("vocab", "") or "")
 
         self.style = ttk.Style()
         try:
@@ -436,6 +504,7 @@ class TranscricaoApp:
         self._apply_theme()
         self._on_mode_change()
         self._refresh_devices()
+        self._update_subtitle()
         self._poll_ui_queue()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -453,10 +522,14 @@ class TranscricaoApp:
         header.pack(fill="x", side="top")
         ttk.Label(header, text="🎙️", style="Logo.TLabel").pack(side="left", padx=(18, 6), pady=14)
         ttk.Label(header, text="Transcrição de Áudio", style="Title.TLabel").pack(side="left", pady=14)
-        ttk.Label(header, text="local · offline", style="Subtitle.TLabel").pack(side="left", padx=10, pady=(20, 12))
+        self.subtitle_lbl = ttk.Label(header, text="local · offline", style="Subtitle.TLabel")
+        self.subtitle_lbl.pack(side="left", padx=10, pady=(20, 12))
         self.theme_btn = ttk.Button(header, text="", width=12, style="Ghost.TButton",
                                     command=self._toggle_theme)
-        self.theme_btn.pack(side="right", padx=16)
+        self.theme_btn.pack(side="right", padx=(6, 16))
+        self.settings_btn = ttk.Button(header, text="⚙  Configurações", style="Ghost.TButton",
+                                       command=self._open_settings)
+        self.settings_btn.pack(side="right", padx=6)
 
         # -------- Card de controles --------
         outer = ttk.Frame(self.root, style="Bg.TFrame")
@@ -546,7 +619,18 @@ class TranscricaoApp:
         s.configure("Subtitle.TLabel", background=c["surface"], foreground=c["muted"], font=(FONT, 10))
         s.configure("Field.TLabel", background=c["surface"], foreground=c["muted"], font=(FONT, 10, "bold"))
         s.configure("Status.TLabel", background=c["surface2"], foreground=c["fg"], font=(FONT, 10))
+        s.configure("Hint.TLabel", background=c["surface"], foreground=c["muted"], font=(FONT, 9))
         s.configure("TLabel", background=c["surface"], foreground=c["fg"])
+
+        # Entry e Checkbutton (usados na janela de Configurações)
+        s.configure("TEntry", fieldbackground=c["surface2"], foreground=c["fg"],
+                    bordercolor=c["border"], lightcolor=c["border"], darkcolor=c["border"],
+                    insertcolor=c["fg"], padding=6)
+        s.configure("TCheckbutton", background=c["surface"], foreground=c["fg"],
+                    font=(FONT, 10), indicatorcolor=c["surface2"], bordercolor=c["border"])
+        s.map("TCheckbutton",
+              background=[("active", c["surface"])],
+              indicatorcolor=[("selected", c["accent"]), ("!selected", c["surface2"])])
 
         # status dot muda de cor conforme estado (idle/rec)
         s.configure("DotIdle.TLabel", background=c["surface2"], foreground=c["muted"], font=(FONT, 11))
@@ -672,6 +756,85 @@ class TranscricaoApp:
     def _set_status(self, msg):
         self.status_var.set(msg)
 
+    def _update_subtitle(self):
+        if self.engine == ENGINE_OPENAI:
+            self.subtitle_lbl.config(text=f"OpenAI · {self.openai_model}")
+        else:
+            self.subtitle_lbl.config(text="local · offline")
+
+    # ---------------------------------------------------------- configurações --
+    def _open_settings(self):
+        c = THEMES[self.theme_name]
+        win = tk.Toplevel(self.root)
+        win.title("Configurações")
+        win.configure(bg=c["surface"])
+        win.transient(self.root)
+        win.resizable(False, False)
+        try:
+            set_titlebar_dark(win, self.theme_name == "dark")
+        except Exception:
+            pass
+
+        pad = {"padx": 16}
+        engine_var = tk.StringVar(value=self.engine)
+        key_var = tk.StringVar(value=self.openai_key)
+        omodel_var = tk.StringVar(value=self.openai_model)
+
+        ttk.Label(win, text="Motor de transcrição", style="Field.TLabel").pack(anchor="w", pady=(16, 4), **pad)
+        eng = ttk.Frame(win, style="Card.TFrame")
+        eng.pack(anchor="w", **pad)
+        ttk.Radiobutton(eng, text="💻  Local (faster-whisper) — offline, grátis",
+                        value=ENGINE_LOCAL, variable=engine_var, style="Mode.Toolbutton").pack(side="left")
+        ttk.Radiobutton(eng, text="☁  OpenAI (nuvem) — mais preciso",
+                        value=ENGINE_OPENAI, variable=engine_var, style="Mode.Toolbutton").pack(side="left", padx=6)
+
+        ttk.Label(win, text="Chave da API OpenAI (sk-...)", style="Field.TLabel").pack(anchor="w", pady=(16, 4), **pad)
+        key_entry = ttk.Entry(win, textvariable=key_var, show="•", width=54)
+        key_entry.pack(anchor="w", **pad)
+        show_var = tk.BooleanVar(value=False)
+        def _toggle_show():
+            key_entry.config(show="" if show_var.get() else "•")
+        ttk.Checkbutton(win, text="Mostrar chave", variable=show_var, command=_toggle_show,
+                        style="TCheckbutton").pack(anchor="w", pady=(4, 0), **pad)
+        ttk.Label(win, text="A chave é salva localmente em ~/.transcricao_audio.json (texto puro).\n"
+                            "Alternativa: definir a variável de ambiente OPENAI_API_KEY.",
+                  style="Hint.TLabel", justify="left").pack(anchor="w", pady=(2, 0), **pad)
+
+        ttk.Label(win, text="Modelo OpenAI", style="Field.TLabel").pack(anchor="w", pady=(16, 4), **pad)
+        ttk.Combobox(win, textvariable=omodel_var, state="readonly", values=OPENAI_MODELS,
+                     width=28, style="TCombobox").pack(anchor="w", **pad)
+
+        ttk.Label(win, text="Vocabulário / contexto (nomes, siglas, jargão — melhora muito)",
+                  style="Field.TLabel").pack(anchor="w", pady=(16, 4), **pad)
+        vocab_txt = tk.Text(win, width=54, height=4, wrap="word", font=(FONT, 10),
+                            relief="flat", padx=8, pady=6, highlightthickness=1,
+                            bg=c["surface2"], fg=c["fg"], insertbackground=c["fg"],
+                            highlightbackground=c["border"], highlightcolor=c["accent"])
+        vocab_txt.pack(anchor="w", **pad)
+        vocab_txt.insert("1.0", self.vocab)
+
+        btns = ttk.Frame(win, style="Card.TFrame")
+        btns.pack(anchor="e", pady=16, **pad)
+
+        def _save():
+            self.engine = engine_var.get()
+            self.openai_key = key_var.get().strip()
+            self.openai_model = omodel_var.get()
+            self.vocab = vocab_txt.get("1.0", "end").strip()
+            self.cfg.update({"engine": self.engine, "openai_key": self.openai_key,
+                             "openai_model": self.openai_model, "vocab": self.vocab})
+            save_config(self.cfg)
+            self._update_subtitle()
+            self._set_status("Configurações salvas.")
+            win.destroy()
+
+        ttk.Button(btns, text="Cancelar", style="TButton", command=win.destroy).pack(side="right", padx=(6, 0))
+        ttk.Button(btns, text="💾  Salvar", style="Start.TButton", command=_save).pack(side="right")
+
+        win.update_idletasks()
+        win.grab_set()
+        key_entry.focus_set()
+
     # --------------------------------------------------------------- ações --
     def start(self):
         if self.running:
@@ -736,6 +899,7 @@ class TranscricaoApp:
         self.start_btn.config(state="disabled" if running else "normal")
         self.stop_btn.config(state="normal" if running else "disabled")
         self.refresh_btn.config(state=state_ctrl)
+        self.settings_btn.config(state=state_ctrl)
         self.model_combo.config(state=combo_state)
         self.mic_combo.config(state=combo_state)
         self.sys_combo.config(state=combo_state)
@@ -743,12 +907,22 @@ class TranscricaoApp:
 
     # --------------------------------------------------------------- worker --
     def _worker(self, mode, model_size, mic_info, sys_info):
-        try:
-            self._load_model_if_needed(model_size)
-        except Exception as e:
-            self._post("error", f"Falha ao carregar o modelo:\n{e}")
-            self._post("stopped", None)
-            return
+        self._context_tail = ""
+        engine = self.engine
+        if engine == ENGINE_OPENAI:
+            if not self._openai_key():
+                self._post("error", "Modo OpenAI selecionado, mas nenhuma chave foi informada.\n"
+                                    "Abra ⚙ Configurações, cole sua chave da OpenAI (ou defina a "
+                                    "variável de ambiente OPENAI_API_KEY) e tente novamente.")
+                self._post("stopped", None)
+                return
+        else:
+            try:
+                self._load_model_if_needed(model_size)
+            except Exception as e:
+                self._post("error", f"Falha ao carregar o modelo:\n{e}")
+                self._post("stopped", None)
+                return
 
         err = lambda m: self._post("error", m)
         self.all_threads = []
@@ -775,23 +949,67 @@ class TranscricaoApp:
             self.all_threads = [miccap, syscap, mixer]
             self.feeders = [mixer]
 
-        self._post("status", f"● Gravando... (modelo '{model_size}' em {self.device_used}).")
+        if engine == ENGINE_OPENAI:
+            where = f"OpenAI · {self.openai_model}"
+            min_flush, max_flush = 8.0, 24.0
+        else:
+            where = f"modelo '{model_size}' em {self.device_used}"
+            min_flush, max_flush = MIN_FLUSH_SECONDS, MAX_FLUSH_SECONDS
+        self._post("status", f"● Gravando... ({where}). Cortando em pausas p/ mais precisão.")
 
+        # Acumula o áudio e só transcreve ao detectar uma PAUSA (silêncio) ou ao
+        # atingir o tamanho máximo — trechos maiores e cortes em pausas dão
+        # transcrições bem mais precisas do que blocos fixos curtos.
+        buffer, buf_secs = [], 0.0
+        stop_seen_at = None
+        dropped_warned = False
         while True:
             try:
                 chunk = self.audio_queue.get(timeout=0.25)
             except queue.Empty:
+                # Espera os produtores (captura/mixer) realmente morrerem e a fila
+                # esvaziar — assim a "cauda" (inclusive o bloco final do mixer, que
+                # pode sair ~1s após o Stop) é sempre transcrita. Só encerra por
+                # tempo (grace) se algo travou de vez numa chamada nativa.
                 feeders_done = all(not t.is_alive() for t in self.feeders)
-                # get(0.25) já dá tempo da captura despejar a "cauda"; ao ver a
-                # fila vazia com Stop pedido (ou produtores mortos), encerra.
-                if (feeders_done or self.stop_event.is_set()) and self.audio_queue.empty():
+                if self.stop_event.is_set() and stop_seen_at is None:
+                    stop_seen_at = time.monotonic()
+                grace = (stop_seen_at is not None
+                         and (time.monotonic() - stop_seen_at) > 4.0)
+                if (feeders_done or grace) and self.audio_queue.empty():
+                    if buffer:
+                        self._transcribe_segment(np.concatenate(buffer), engine)
                     break
                 continue
-            self._transcribe_chunk(chunk)
+            buffer.append(chunk)
+            buf_secs += chunk.size / float(TARGET_RATE)
+            trailing_silence = rms(chunk) < SILENCE_RMS
+            if buf_secs >= max_flush or (buf_secs >= min_flush and trailing_silence):
+                self._transcribe_segment(np.concatenate(buffer), engine)
+                buffer, buf_secs = [], 0.0
+            # Válvula de segurança: se a transcrição não acompanha (CPU lenta ou
+            # API travada), descarta o excesso da fila p/ não estourar a memória.
             backlog = self.audio_queue.qsize()
-            if backlog > 1:
-                self._post("status", f"Transcrevendo... ({backlog} bloco(s) na fila)")
+            if backlog > MAX_BACKLOG_SECONDS:
+                dropped = 0
+                while self.audio_queue.qsize() > MAX_BACKLOG_SECONDS:
+                    try:
+                        self.audio_queue.get_nowait()
+                        dropped += 1
+                    except queue.Empty:
+                        break
+                if dropped and not dropped_warned:
+                    dropped_warned = True
+                    self._post("warn", "A máquina não está acompanhando o tempo real — "
+                                       "descartando áudio atrasado. Use um modelo menor ou a GPU.")
+            elif backlog > 3:
+                self._post("status", f"Transcrevendo... (~{backlog}s de áudio em espera)")
 
+        # Espera captura/mixer morrerem ANTES de liberar novo Start: abrir streams
+        # novos enquanto os antigos ainda fecham pode causar crash nativo no PyAudio.
+        for th in list(self.all_threads):
+            if th is not threading.current_thread():
+                th.join(timeout=3.0)
         self._post("status", "Parado.")
         self._post("stopped", None)
 
@@ -825,17 +1043,48 @@ class TranscricaoApp:
                                        language=LANGUAGE, beam_size=1)
         list(segments)
 
-    def _transcribe_chunk(self, audio16k):
+    def _build_prompt(self):
+        """Contexto passado ao modelo: vocabulário do usuário + fim do texto já
+        transcrito (ajuda em nomes/jargão e mantém continuidade entre trechos)."""
+        parts = []
+        if self.vocab and self.vocab.strip():
+            parts.append(self.vocab.strip())
+        if self._context_tail.strip():
+            parts.append(self._context_tail.strip())
+        return " ".join(parts).strip()
+
+    def _openai_key(self):
+        return (self.openai_key or "").strip() or os.environ.get("OPENAI_API_KEY", "").strip()
+
+    def _transcribe_segment(self, audio16k, engine):
+        if audio16k is None or audio16k.size == 0:
+            return
         try:
-            segments, _ = self.model.transcribe(
-                audio16k, language=LANGUAGE, beam_size=5, vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 500},
-                condition_on_previous_text=False)
-            text = " ".join(seg.text.strip() for seg in segments).strip()
+            if engine == ENGINE_OPENAI:
+                text = openai_transcribe(audio16k, self._openai_key(),
+                                         self.openai_model, self._build_prompt())
+            else:
+                prompt = self._build_prompt()
+                segments, _ = self.model.transcribe(
+                    audio16k, language=LANGUAGE, beam_size=5, best_of=5,
+                    vad_filter=True, vad_parameters={"min_silence_duration_ms": 400},
+                    condition_on_previous_text=True,
+                    initial_prompt=prompt or None)
+                text = " ".join(seg.text.strip() for seg in segments).strip()
             if text:
+                self._context_tail = (self._context_tail + " " + text)[-CONTEXT_TAIL_CHARS:]
                 self._post("text", text)
         except Exception as e:
-            self._post("warn", f"Falha ao transcrever um bloco (ignorado): {e}")
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if engine == ENGINE_OPENAI and status in (401, 403):
+                # Chave inválida: não adianta continuar tentando. Encerra e avisa.
+                self.stop_event.set()
+                self._post("error", f"Chave da OpenAI recusada (HTTP {status}). "
+                                    f"Ajuste a chave em ⚙ Configurações e tente novamente.")
+            elif engine == ENGINE_OPENAI:
+                self._post("warn", f"Falha na API OpenAI (trecho ignorado): {e}")
+            else:
+                self._post("warn", f"Falha ao transcrever um trecho (ignorado): {e}")
 
     # ------------------------------------------------------- comunicação UI --
     def _post(self, kind, payload):
@@ -894,7 +1143,9 @@ class TranscricaoApp:
 
     def _on_close(self):
         self.cfg.update({"theme": self.theme_name, "mode": self.mode_var.get(),
-                         "model": self.model_var.get()})
+                         "model": self.model_var.get(), "engine": self.engine,
+                         "openai_key": self.openai_key, "openai_model": self.openai_model,
+                         "vocab": self.vocab})
         save_config(self.cfg)
         self.stop_event.set()
         threads_done = True

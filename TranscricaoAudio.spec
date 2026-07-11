@@ -26,6 +26,8 @@ _packages = [
     "tokenizers",       # tokenizer do Whisper
     "huggingface_hub",  # download do modelo na 1ª execução
     "pyaudiowpatch",    # captura de áudio (mic + WASAPI loopback)
+    "httpx",            # chamadas à API da OpenAI (motor opcional em nuvem)
+    "certifi",          # bundle de certificados p/ HTTPS (OpenAI)
 ]
 
 datas, binaries, hiddenimports = [], [], []

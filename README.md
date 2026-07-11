@@ -61,7 +61,10 @@ pip install -r requirements-gpu.txt
 
 ## ▶️ Como usar
 
-Com o ambiente ativado (`venv\Scripts\activate`):
+**Modo mais fácil (recomendado, usa a GPU):** dê **duplo-clique em
+`Executar-GPU.bat`**.
+
+Ou, pelo terminal com o ambiente ativado (`venv\Scripts\activate`):
 
 ```bat
 python transcricao_audio.py
@@ -75,15 +78,56 @@ Na janela:
    - Em **Ambos** aparecem os dois — o app mistura as duas fontes.
 2. **Dispositivo(s)** — selecione a entrada/saída desejada (clique **⟳ Atualizar**
    se plugar um dispositivo novo).
-3. **Modelo** — `tiny`, `base`, `small` (padrão) ou `medium`.
-   - `tiny`/`base` = mais rápidos, menos precisos.
-   - `small` = ótimo equilíbrio (padrão).
-   - `medium` = mais preciso, mais pesado (recomendado com GPU).
+3. **Modelo** — do mais leve/rápido ao mais preciso:
+   - `tiny`/`base` = rápidos, menos precisos.
+   - `small` = equilíbrio (padrão).
+   - `medium` = mais preciso, mais pesado.
+   - **`large-v3-turbo`** = **recomendado com GPU** — quase a qualidade do
+     `large-v3` com muito mais velocidade.
+   - `large-v3` = máxima qualidade (pesado; use com GPU).
 4. **▶ Iniciar** — começa a transcrever. O texto aparece na caixa rolável.
-5. **■ Parar** — encerra (processa os últimos blocos antes de parar).
+5. **■ Parar** — encerra (processa os últimos trechos antes de parar).
 6. **🧹 Limpar** — apaga o texto.
 7. **💾 Salvar .txt** — grava a transcrição em um arquivo de texto (UTF-8).
 8. **☀/🌙 (canto superior direito)** — alterna entre tema claro e escuro.
+9. **⚙ Configurações** — motor (Local ou OpenAI), chave da API, e o campo de
+   **vocabulário/contexto** (veja abaixo).
+
+### 🎯 Como conseguir a MELHOR qualidade
+
+A qualidade depende, em ordem de impacto:
+
+1. **Use a GPU + um modelo grande.** O `.exe` roda só na CPU. Para usar sua
+   **GPU NVIDIA**, execute pelo código-fonte — o jeito mais fácil é dar
+   **duplo-clique em `Executar-GPU.bat`**. Aí escolha o modelo
+   **`large-v3-turbo`** (ou `large-v3`). Isso sozinho já muda tudo.
+2. **Preencha o Vocabulário/contexto** (⚙ Configurações): liste nomes, siglas e
+   jargões do seu conteúdo (ex.: `Pridvê, MoCap, back-end, deploy, Lucas`). O
+   modelo passa a acertar essas palavras.
+3. **Corte em pausas (automático).** O app agora acumula o áudio e só transcreve
+   ao detectar uma **pausa** (ou a cada ~15 s), mantendo o **contexto** entre
+   trechos — muito melhor que blocos fixos curtos.
+4. **Prefira "Microfone" ou "Sistema" a "Ambos"** quando possível. Misturar as
+   duas fontes com falas sobrepostas atrapalha o reconhecimento.
+
+### ☁ Usar a OpenAI (opcional, mais preciso)
+
+Se quiser a melhor precisão sem depender do seu PC, use o motor **OpenAI**
+(atenção: aí o áudio é enviado para a nuvem — deixa de ser 100% offline).
+
+**Onde colocar a chave:**
+1. Pegue uma chave em <https://platform.openai.com/api-keys> (começa com `sk-`).
+2. No app: **⚙ Configurações** → marque **OpenAI (nuvem)** → cole a chave no
+   campo **"Chave da API OpenAI"** → escolha o modelo → **Salvar**.
+   - Modelos: `gpt-4o-mini-transcribe` (barato e ótimo — padrão),
+     `gpt-4o-transcribe` (melhor), `whisper-1` (clássico).
+   - A chave fica salva em `%USERPROFILE%\.transcricao_audio.json` (texto puro).
+3. **Alternativa (sem salvar no disco):** defina a variável de ambiente
+   `OPENAI_API_KEY` antes de abrir o app. Ex. no PowerShell:
+   ```powershell
+   setx OPENAI_API_KEY "sk-suachave"
+   ```
+   (feche e reabra o terminal/app depois do `setx`).
 
 ### ⚠️ Primeira execução: download do modelo
 
@@ -169,10 +213,15 @@ pyinstaller --noconfirm --onefile --windowed --name TranscricaoAudio --collect-a
 
 - O áudio é capturado em `int16`, convertido para **mono float32** e
   **reamostrado para 16 kHz** (formato que o Whisper espera).
-- Cada bloco de ~5 s é transcrito de forma **independente**, com `vad_filter`
-  (ignora silêncio e reduz "alucinações"). Como os blocos são independentes,
-  pode haver pequenos cortes de palavra na fronteira dos blocos — comportamento
-  esperado para transcrição em tempo real por blocos.
+- **Segmentação por pausa (não por blocos fixos):** o áudio é acumulado e só
+  transcrito ao detectar um **silêncio** (pausa natural) ou ao atingir ~15 s.
+  Assim os cortes caem em pausas, não no meio de palavras. Cada trecho é
+  transcrito com `beam_size=5`, `best_of=5`, `condition_on_previous_text=True`
+  e um `initial_prompt` (vocabulário do usuário + fim do texto anterior), o que
+  melhora muito nomes/jargão e a continuidade.
+- **Motores:** `local` (faster-whisper, offline) ou `openai` (API na nuvem —
+  `gpt-4o-mini-transcribe`/`gpt-4o-transcribe`/`whisper-1`), selecionável em
+  ⚙ Configurações.
 - GPU: `device="cuda"`, `compute_type="float16"`. CPU: `device="cpu"`,
   `compute_type="int8"`. A escolha e o *fallback* são automáticos.
 - Se a máquina **não acompanha o tempo real** (ex.: modelo `medium` na CPU), os
@@ -201,6 +250,7 @@ pyinstaller --noconfirm --onefile --windowed --name TranscricaoAudio --collect-a
 TranscricaoAudio/
 ├─ transcricao_audio.py     # aplicativo (GUI + captura + transcrição)
 ├─ verificar_ambiente.py    # diagnóstico de libs/GPU/dispositivos
+├─ Executar-GPU.bat         # abre o app pelo código-fonte usando a GPU
 ├─ requirements.txt         # dependências (CPU)
 ├─ requirements-gpu.txt     # dependências CUDA (opcional)
 ├─ TranscricaoAudio.spec    # configuração do PyInstaller
