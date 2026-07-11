@@ -34,7 +34,6 @@ from datetime import datetime
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from tkinter.scrolledtext import ScrolledText
 
 import numpy as np
 import pyaudiowpatch as pyaudio
@@ -118,9 +117,15 @@ def load_config():
 
 
 def save_config(cfg):
+    # Escrita atômica: grava num .tmp e troca; evita corromper o arquivo se o
+    # processo for interrompido no meio da escrita.
     try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_PATH)
     except Exception:
         pass
 
@@ -331,12 +336,17 @@ class MixerThread(threading.Thread):
 
     def run(self):
         while True:
-            sources_dead = all(not t.is_alive() for t in self.sources)
-            if sources_dead and self.mic_q.empty() and self.sys_q.empty():
-                break
+            # _get espera até 1 s; se houver "cauda" após o Stop, ela chega nessa
+            # janela e é processada antes de encerrar (não perde áudio final).
             m = self._get(self.mic_q)
             s = self._get(self.sys_q)
             if m is None and s is None:
+                sources_dead = all(not t.is_alive() for t in self.sources)
+                # Encerra se as fontes morreram OU se foi pedido Stop (mesmo que
+                # uma captura tenha travado numa chamada nativa do PyAudio).
+                if (sources_dead or self.stop_event.is_set()) \
+                        and self.mic_q.empty() and self.sys_q.empty():
+                    break
                 continue
             block = self._mix(m, s)
             if block is not None and block.size:
@@ -431,8 +441,10 @@ class TranscricaoApp:
 
     # ------------------------------------------------------------------ UI --
     def _build_ui(self):
-        self.mode_var = tk.StringVar(value=self.cfg.get("mode", MODE_MIC))
-        self.model_var = tk.StringVar(value=self.cfg.get("model", DEFAULT_MODEL))
+        saved_mode = self.cfg.get("mode", MODE_MIC)
+        saved_model = self.cfg.get("model", DEFAULT_MODEL)
+        self.mode_var = tk.StringVar(value=saved_mode if saved_mode in MODE_LABELS else MODE_MIC)
+        self.model_var = tk.StringVar(value=saved_model if saved_model in MODELS else DEFAULT_MODEL)
         self.mic_device_var = tk.StringVar()
         self.sys_device_var = tk.StringVar()
 
@@ -510,9 +522,13 @@ class TranscricaoApp:
         # -------- Área de texto --------
         textwrap = ttk.Frame(self.root, style="Bg.TFrame")
         textwrap.pack(fill="both", expand=True, padx=16, pady=(8, 16))
-        self.text = ScrolledText(textwrap, wrap="word", font=(FONT, 12), relief="flat",
-                                 borderwidth=0, padx=14, pady=12)
-        self.text.pack(fill="both", expand=True)
+        self.text = tk.Text(textwrap, wrap="word", font=(FONT, 12), relief="flat",
+                            borderwidth=0, padx=14, pady=12, highlightthickness=0)
+        vsb = ttk.Scrollbar(textwrap, orient="vertical", style="Vertical.TScrollbar",
+                            command=self.text.yview)
+        self.text.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.text.pack(side="left", fill="both", expand=True)
 
     # ---------------------------------------------------------------- tema --
     def _apply_theme(self):
@@ -574,10 +590,25 @@ class TranscricaoApp:
         self.root.option_add("*TCombobox*Listbox.selectBackground", c["accent"])
         self.root.option_add("*TCombobox*Listbox.selectForeground", c["accent_fg"])
         self.root.option_add("*TCombobox*Listbox.font", (FONT, 10))
+        # option_add só afeta popdowns criados DEPOIS. Reestiliza os já existentes
+        # para o tema mudar na hora (ao alternar claro/escuro).
+        for combo in (getattr(self, "mic_combo", None), getattr(self, "sys_combo", None),
+                      getattr(self, "model_combo", None)):
+            if combo is None:
+                continue
+            try:
+                pop = combo.tk.call("ttk::combobox::PopdownWindow", combo)
+                lb = pop + ".f.l"
+                combo.tk.call(lb, "configure", "-background", c["surface"],
+                              "-foreground", c["fg"], "-selectbackground", c["accent"],
+                              "-selectforeground", c["accent_fg"])
+            except Exception:
+                pass
 
         # Scrollbar
         s.configure("Vertical.TScrollbar", background=c["btn"], troughcolor=c["surface2"],
                     bordercolor=c["surface2"], arrowcolor=c["muted"], relief="flat")
+        s.map("Vertical.TScrollbar", background=[("active", c["btn_hi"])])
 
         # Área de texto
         self.text.configure(background=c["surface"], foreground=c["fg"],
@@ -750,7 +781,10 @@ class TranscricaoApp:
             try:
                 chunk = self.audio_queue.get(timeout=0.25)
             except queue.Empty:
-                if all(not t.is_alive() for t in self.feeders) and self.audio_queue.empty():
+                feeders_done = all(not t.is_alive() for t in self.feeders)
+                # get(0.25) já dá tempo da captura despejar a "cauda"; ao ver a
+                # fila vazia com Stop pedido (ou produtores mortos), encerra.
+                if (feeders_done or self.stop_event.is_set()) and self.audio_queue.empty():
                     break
                 continue
             self._transcribe_chunk(chunk)
@@ -810,24 +844,33 @@ class TranscricaoApp:
     def _poll_ui_queue(self):
         try:
             while True:
-                kind, payload = self.ui_queue.get_nowait()
-                if kind == "text":
-                    self._append_text(payload)
-                elif kind in ("status", "warn"):
-                    self._set_status(payload)
-                elif kind == "error":
-                    first_line = (payload or "Erro.").splitlines()[0]
-                    self._set_status("Erro: " + first_line)
-                    # Mostra o pop-up modal só uma vez por sessão (em "Ambos", as
-                    # duas capturas podem falhar e empilhariam diálogos).
-                    if not self._error_shown:
-                        self._error_shown = True
-                        messagebox.showerror("Erro", payload)
-                elif kind == "stopped":
-                    self._on_stopped()
-        except queue.Empty:
-            pass
-        self.root.after(100, self._poll_ui_queue)
+                try:
+                    kind, payload = self.ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    if kind == "text":
+                        self._append_text(payload)
+                    elif kind in ("status", "warn"):
+                        self._set_status(payload)
+                    elif kind == "error":
+                        first_line = (payload or "Erro.").splitlines()[0]
+                        self._set_status("Erro: " + first_line)
+                        # Modal só uma vez por sessão (em "Ambos", as duas capturas
+                        # podem falhar e empilhariam diálogos).
+                        if not self._error_shown:
+                            self._error_shown = True
+                            messagebox.showerror("Erro", payload)
+                    elif kind == "stopped":
+                        self._on_stopped()
+                except Exception:
+                    pass  # um erro num handler não pode matar o polling da UI
+        finally:
+            # Reagenda SEMPRE (senão a UI pararia de atualizar para sempre).
+            try:
+                self.root.after(100, self._poll_ui_queue)
+            except Exception:
+                pass
 
     def _append_text(self, text):
         at_end = self.text.yview()[1] >= 0.999
