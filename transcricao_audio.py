@@ -29,6 +29,7 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 import io
 import json
 import queue
+import re
 import threading
 import time
 import traceback
@@ -66,7 +67,8 @@ LANGUAGE = "pt"
 # Motores de transcrição
 ENGINE_LOCAL = "local"
 ENGINE_OPENAI = "openai"
-OPENAI_MODELS = ["gpt-4o-mini-transcribe", "gpt-4o-transcribe", "whisper-1"]
+DIARIZE_MODEL = "gpt-4o-transcribe-diarize"   # separa falantes (só na OpenAI)
+OPENAI_MODELS = ["gpt-4o-mini-transcribe", "gpt-4o-transcribe", "whisper-1", DIARIZE_MODEL]
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini-transcribe"
 OPENAI_URL = "https://api.openai.com/v1/audio/transcriptions"
 
@@ -76,6 +78,9 @@ MODE_BOTH = "both"
 MODE_LABELS = {MODE_MIC: "🎤  Microfone",
                MODE_SYS: "🔊  Sistema",
                MODE_BOTH: "🎤+🔊  Ambos"}
+# Rótulos das fontes no modo "Ambos" (separa você x os outros)
+LABEL_MIC = "🎤 Você"
+LABEL_SYS = "🔊 Outros"
 
 FONT = "Segoe UI"
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".transcricao_audio.json")
@@ -225,6 +230,30 @@ def openai_transcribe(audio16k, api_key, model, prompt=""):
                    data=data, files=files, timeout=120.0)
     r.raise_for_status()
     return r.text.strip()
+
+
+def openai_diarize(audio16k, api_key):
+    """Transcreve COM separação de falantes (gpt-4o-transcribe-diarize).
+    Retorna lista de (falante, texto). Diarize não aceita prompt/idioma."""
+    import httpx
+    wav = float32_to_wav_bytes(audio16k)
+    data = {"model": DIARIZE_MODEL, "response_format": "diarized_json",
+            "chunking_strategy": "auto"}
+    files = {"file": ("audio.wav", wav, "audio/wav")}
+    r = httpx.post(OPENAI_URL, headers={"Authorization": f"Bearer {api_key}"},
+                   data=data, files=files, timeout=180.0)
+    r.raise_for_status()
+    js = r.json()
+    out = []
+    for seg in js.get("segments", []):
+        txt = (seg.get("text") or "").strip()
+        if txt:
+            out.append((str(seg.get("speaker", "?")), txt))
+    if not out:
+        full = (js.get("text") or "").strip()
+        if full:
+            out.append(("?", full))
+    return out
 
 
 def add_cuda_dll_dirs():
@@ -378,59 +407,6 @@ class CaptureThread(threading.Thread):
 
 
 # ---------------------------------------------------------------------------
-# Thread mixadora (combina microfone + sistema num único bloco)
-# ---------------------------------------------------------------------------
-class MixerThread(threading.Thread):
-    def __init__(self, mic_q, sys_q, out_q, stop_event, sources):
-        super().__init__(daemon=True)
-        self.mic_q = mic_q
-        self.sys_q = sys_q
-        self.out_q = out_q
-        self.stop_event = stop_event
-        self.sources = sources  # threads de captura (mic, sys)
-
-    def run(self):
-        while True:
-            # _get espera até 1 s; se houver "cauda" após o Stop, ela chega nessa
-            # janela e é processada antes de encerrar (não perde áudio final).
-            m = self._get(self.mic_q)
-            s = self._get(self.sys_q)
-            if m is None and s is None:
-                sources_dead = all(not t.is_alive() for t in self.sources)
-                # Encerra se as fontes morreram OU se foi pedido Stop (mesmo que
-                # uma captura tenha travado numa chamada nativa do PyAudio).
-                if (sources_dead or self.stop_event.is_set()) \
-                        and self.mic_q.empty() and self.sys_q.empty():
-                    break
-                continue
-            block = self._mix(m, s)
-            if block is not None and block.size:
-                self.out_q.put(block)
-
-    @staticmethod
-    def _get(q, timeout=1.0):
-        try:
-            return q.get(timeout=timeout)
-        except queue.Empty:
-            return None
-
-    @staticmethod
-    def _mix(m, s):
-        if m is None:
-            return s
-        if s is None:
-            return m
-        n = max(m.size, s.size)
-        if m.size < n:
-            m = np.pad(m, (0, n - m.size))
-        if s.size < n:
-            s = np.pad(s, (0, n - s.size))
-        mixed = m + s
-        np.clip(mixed, -1.0, 1.0, out=mixed)
-        return mixed.astype(np.float32)
-
-
-# ---------------------------------------------------------------------------
 # Título da janela em modo escuro (barra do Windows)
 # ---------------------------------------------------------------------------
 def set_titlebar_dark(root, dark):
@@ -480,7 +456,7 @@ class TranscricaoApp:
         self.running = False
         self._mic_map = {}
         self._sys_map = {}
-        self._context_tail = ""
+        self.show_timestamps = bool(self.cfg.get("timestamps", True))
 
         # Motor / OpenAI / vocabulário (carregados da config)
         self.engine = self.cfg.get("engine", ENGINE_LOCAL)
@@ -779,6 +755,7 @@ class TranscricaoApp:
         engine_var = tk.StringVar(value=self.engine)
         key_var = tk.StringVar(value=self.openai_key)
         omodel_var = tk.StringVar(value=self.openai_model)
+        ts_var = tk.BooleanVar(value=self.show_timestamps)
 
         ttk.Label(win, text="Motor de transcrição", style="Field.TLabel").pack(anchor="w", pady=(16, 4), **pad)
         eng = ttk.Frame(win, style="Card.TFrame")
@@ -803,6 +780,11 @@ class TranscricaoApp:
         ttk.Label(win, text="Modelo OpenAI", style="Field.TLabel").pack(anchor="w", pady=(16, 4), **pad)
         ttk.Combobox(win, textvariable=omodel_var, state="readonly", values=OPENAI_MODELS,
                      width=28, style="TCombobox").pack(anchor="w", **pad)
+        ttk.Label(win, text="gpt-4o-transcribe-diarize = separa os falantes (Falante 1, 2...).",
+                  style="Hint.TLabel").pack(anchor="w", pady=(2, 0), **pad)
+
+        ttk.Checkbutton(win, text="Mostrar horário [hh:mm] em cada trecho", variable=ts_var,
+                        style="TCheckbutton").pack(anchor="w", pady=(16, 0), **pad)
 
         ttk.Label(win, text="Vocabulário / contexto (nomes, siglas, jargão — melhora muito)",
                   style="Field.TLabel").pack(anchor="w", pady=(16, 4), **pad)
@@ -821,8 +803,10 @@ class TranscricaoApp:
             self.openai_key = key_var.get().strip()
             self.openai_model = omodel_var.get()
             self.vocab = vocab_txt.get("1.0", "end").strip()
+            self.show_timestamps = ts_var.get()
             self.cfg.update({"engine": self.engine, "openai_key": self.openai_key,
-                             "openai_model": self.openai_model, "vocab": self.vocab})
+                             "openai_model": self.openai_model, "vocab": self.vocab,
+                             "timestamps": self.show_timestamps})
             save_config(self.cfg)
             self._update_subtitle()
             self._set_status("Configurações salvas.")
@@ -926,28 +910,26 @@ class TranscricaoApp:
 
         err = lambda m: self._post("error", m)
         self.all_threads = []
+
+        # Cada FONTE de áudio é um "stream" independente (buffer + contexto
+        # próprios). No modo "Ambos" isso separa você (microfone) dos outros
+        # (sistema) em vez de misturar — mais qualidade e já rotula quem falou.
+        def make_stream(info, q, label):
+            self._drain_queue(q)
+            cap = CaptureThread(self.pa, info["index"], info["rate"], info["channels"],
+                                q, self.stop_event, err)
+            cap.start()
+            self.all_threads.append(cap)
+            return {"q": q, "label": label, "buf": [], "secs": 0.0, "tail": ""}
+
+        streams = []
         if mode == MODE_MIC:
-            cap = CaptureThread(self.pa, mic_info["index"], mic_info["rate"],
-                                mic_info["channels"], self.audio_queue, self.stop_event, err)
-            cap.start()
-            self.all_threads = [cap]
-            self.feeders = [cap]
+            streams.append(make_stream(mic_info, self.mic_q, ""))
         elif mode == MODE_SYS:
-            cap = CaptureThread(self.pa, sys_info["index"], sys_info["rate"],
-                                sys_info["channels"], self.audio_queue, self.stop_event, err)
-            cap.start()
-            self.all_threads = [cap]
-            self.feeders = [cap]
-        else:  # MODE_BOTH
-            miccap = CaptureThread(self.pa, mic_info["index"], mic_info["rate"],
-                                   mic_info["channels"], self.mic_q, self.stop_event, err)
-            syscap = CaptureThread(self.pa, sys_info["index"], sys_info["rate"],
-                                   sys_info["channels"], self.sys_q, self.stop_event, err)
-            mixer = MixerThread(self.mic_q, self.sys_q, self.audio_queue,
-                                self.stop_event, [miccap, syscap])
-            miccap.start(); syscap.start(); mixer.start()
-            self.all_threads = [miccap, syscap, mixer]
-            self.feeders = [mixer]
+            streams.append(make_stream(sys_info, self.sys_q, ""))
+        else:  # MODE_BOTH -> dois streams rotulados, sem mixagem
+            streams.append(make_stream(mic_info, self.mic_q, LABEL_MIC))
+            streams.append(make_stream(sys_info, self.sys_q, LABEL_SYS))
 
         if engine == ENGINE_OPENAI:
             where = f"OpenAI · {self.openai_model}"
@@ -957,56 +939,49 @@ class TranscricaoApp:
             min_flush, max_flush = MIN_FLUSH_SECONDS, MAX_FLUSH_SECONDS
         self._post("status", f"● Gravando... ({where}). Cortando em pausas p/ mais precisão.")
 
-        # Acumula o áudio e só transcreve ao detectar uma PAUSA (silêncio) ou ao
-        # atingir o tamanho máximo — trechos maiores e cortes em pausas dão
-        # transcrições bem mais precisas do que blocos fixos curtos.
-        buffer, buf_secs = [], 0.0
         stop_seen_at = None
         dropped_warned = False
         while True:
-            try:
-                chunk = self.audio_queue.get(timeout=0.25)
-            except queue.Empty:
-                # Espera os produtores (captura/mixer) realmente morrerem e a fila
-                # esvaziar — assim a "cauda" (inclusive o bloco final do mixer, que
-                # pode sair ~1s após o Stop) é sempre transcrita. Só encerra por
-                # tempo (grace) se algo travou de vez numa chamada nativa.
-                feeders_done = all(not t.is_alive() for t in self.feeders)
-                if self.stop_event.is_set() and stop_seen_at is None:
-                    stop_seen_at = time.monotonic()
-                grace = (stop_seen_at is not None
-                         and (time.monotonic() - stop_seen_at) > 4.0)
-                if (feeders_done or grace) and self.audio_queue.empty():
-                    if buffer:
-                        self._transcribe_segment(np.concatenate(buffer), engine)
-                    break
+            got = False
+            for st in streams:
+                try:
+                    chunk = st["q"].get_nowait()
+                except queue.Empty:
+                    continue
+                got = True
+                st["buf"].append(chunk)
+                st["secs"] += chunk.size / float(TARGET_RATE)
+                if st["secs"] >= max_flush or (st["secs"] >= min_flush
+                                               and rms(chunk) < SILENCE_RMS):
+                    self._flush_stream(st, engine)
+                # Válvula de segurança: descarta excesso se não acompanha o tempo real.
+                if st["q"].qsize() > MAX_BACKLOG_SECONDS:
+                    while st["q"].qsize() > MAX_BACKLOG_SECONDS:
+                        try:
+                            st["q"].get_nowait()
+                        except queue.Empty:
+                            break
+                    if not dropped_warned:
+                        dropped_warned = True
+                        self._post("warn", "A máquina não está acompanhando o tempo real — "
+                                           "descartando áudio atrasado. Use um modelo menor ou a GPU.")
+            if got:
                 continue
-            buffer.append(chunk)
-            buf_secs += chunk.size / float(TARGET_RATE)
-            trailing_silence = rms(chunk) < SILENCE_RMS
-            if buf_secs >= max_flush or (buf_secs >= min_flush and trailing_silence):
-                self._transcribe_segment(np.concatenate(buffer), engine)
-                buffer, buf_secs = [], 0.0
-            # Válvula de segurança: se a transcrição não acompanha (CPU lenta ou
-            # API travada), descarta o excesso da fila p/ não estourar a memória.
-            backlog = self.audio_queue.qsize()
-            if backlog > MAX_BACKLOG_SECONDS:
-                dropped = 0
-                while self.audio_queue.qsize() > MAX_BACKLOG_SECONDS:
-                    try:
-                        self.audio_queue.get_nowait()
-                        dropped += 1
-                    except queue.Empty:
-                        break
-                if dropped and not dropped_warned:
-                    dropped_warned = True
-                    self._post("warn", "A máquina não está acompanhando o tempo real — "
-                                       "descartando áudio atrasado. Use um modelo menor ou a GPU.")
-            elif backlog > 3:
-                self._post("status", f"Transcrevendo... (~{backlog}s de áudio em espera)")
+            # Nada disponível agora -> checa término (espera captura morrer e fila
+            # esvaziar p/ não perder a "cauda"; 'grace' escapa de travamento nativo).
+            captures_dead = all(not t.is_alive() for t in self.all_threads)
+            if self.stop_event.is_set() and stop_seen_at is None:
+                stop_seen_at = time.monotonic()
+            grace = stop_seen_at is not None and (time.monotonic() - stop_seen_at) > 4.0
+            all_empty = all(st["q"].empty() for st in streams)
+            if (captures_dead or grace) and all_empty:
+                for st in streams:
+                    self._flush_stream(st, engine)
+                break
+            self.stop_event.wait(0.05)
 
-        # Espera captura/mixer morrerem ANTES de liberar novo Start: abrir streams
-        # novos enquanto os antigos ainda fecham pode causar crash nativo no PyAudio.
+        # Espera as capturas morrerem antes de liberar novo Start (abrir streams
+        # novos enquanto os antigos ainda fecham pode causar crash nativo).
         for th in list(self.all_threads):
             if th is not threading.current_thread():
                 th.join(timeout=3.0)
@@ -1043,66 +1018,97 @@ class TranscricaoApp:
                                        language=LANGUAGE, beam_size=1)
         list(segments)
 
-    def _build_prompt(self):
+    def _build_prompt(self, tail=""):
         """Contexto passado ao modelo: vocabulário do usuário + fim do texto já
-        transcrito (ajuda em nomes/jargão e mantém continuidade entre trechos)."""
+        transcrito daquele stream (ajuda em nomes/jargão e mantém continuidade)."""
         parts = []
         if self.vocab and self.vocab.strip():
             parts.append(self.vocab.strip())
-        if self._context_tail.strip():
-            parts.append(self._context_tail.strip())
+        if tail and tail.strip():
+            parts.append(tail.strip())
         return " ".join(parts).strip()
 
     def _openai_key(self):
         return (self.openai_key or "").strip() or os.environ.get("OPENAI_API_KEY", "").strip()
 
-    def _transcribe_segment(self, audio16k, engine):
+    def _emit_line(self, label, text):
+        """Formata e envia um parágrafo: [hora] Rótulo: frase1 / frase2 / ...
+        (uma frase por linha, para não ficar tudo embolado)."""
+        text = (text or "").strip()
+        if not text:
+            return
+        head = ""
+        if self.show_timestamps:
+            head += "[" + datetime.now().strftime("%H:%M") + "] "
+        if label:
+            head += label + ": "
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?…])\s+", text) if s.strip()]
+        if not sentences:
+            sentences = [text]
+        block = head + sentences[0]
+        for s in sentences[1:]:
+            block += "\n" + s
+        self._post("line", block)
+
+    def _flush_stream(self, st, engine):
+        if not st["buf"]:
+            return
+        audio = np.concatenate(st["buf"])
+        st["buf"] = []
+        st["secs"] = 0.0
+        self._transcribe_stream(audio, engine, st)
+
+    def _transcribe_stream(self, audio16k, engine, st):
         if audio16k is None or audio16k.size == 0:
             return
         try:
+            if engine == ENGINE_OPENAI and self.openai_model == DIARIZE_MODEL:
+                # Separação de falantes: cada segmento vira uma linha rotulada.
+                for speaker, text in openai_diarize(audio16k, self._openai_key()):
+                    self._emit_line(f"🗣 Falante {speaker}", text)
+                return
             if engine == ENGINE_OPENAI:
                 text = openai_transcribe(audio16k, self._openai_key(),
-                                         self.openai_model, self._build_prompt())
+                                         self.openai_model, self._build_prompt(st["tail"]))
             else:
-                prompt = self._build_prompt()
+                prompt = self._build_prompt(st["tail"])
                 segments, _ = self.model.transcribe(
                     audio16k, language=LANGUAGE, beam_size=5, best_of=5,
                     vad_filter=True, vad_parameters={"min_silence_duration_ms": 400},
-                    condition_on_previous_text=True,
-                    initial_prompt=prompt or None)
+                    condition_on_previous_text=True, initial_prompt=prompt or None)
                 text = " ".join(seg.text.strip() for seg in segments).strip()
             if text:
-                self._context_tail = (self._context_tail + " " + text)[-CONTEXT_TAIL_CHARS:]
-                self._post("text", text)
+                st["tail"] = (st["tail"] + " " + text)[-CONTEXT_TAIL_CHARS:]
+                self._emit_line(st["label"], text)
         except Exception as e:
-            status = getattr(getattr(e, "response", None), "status_code", None)
-            body = ""
-            try:
-                body = (e.response.text or "").lower()
-            except Exception:
-                pass
-            quota = "insufficient_quota" in body or "exceeded your current quota" in body
-            if engine == ENGINE_OPENAI and status in (401, 403):
-                # Chave inválida: não adianta continuar tentando. Encerra e avisa.
-                self.stop_event.set()
-                self._post("error", f"Chave da OpenAI recusada (HTTP {status}). "
-                                    f"Ajuste a chave em ⚙ Configurações e tente novamente.")
-            elif engine == ENGINE_OPENAI and status == 429 and quota:
-                # Conta sem créditos/cota: não adianta insistir. Encerra e explica.
-                self.stop_event.set()
-                self._post("error", "Sua conta OpenAI está SEM CRÉDITOS/COTA (HTTP 429).\n\n"
-                                    "Adicione créditos em:\n"
-                                    "https://platform.openai.com/settings/organization/billing\n\n"
-                                    "Ou use o motor 'Local' (grátis) — de preferência com a GPU "
-                                    "(Executar-GPU.bat + modelo large-v3-turbo).")
-            elif engine == ENGINE_OPENAI and status == 429:
-                # Limite de requisições por minuto: espera um pouco e segue.
-                self._post("warn", "OpenAI: limite de requisições (429). Reduzindo o ritmo...")
-                time.sleep(5)
-            elif engine == ENGINE_OPENAI:
-                self._post("warn", f"Falha na API OpenAI (trecho ignorado): {e}")
-            else:
-                self._post("warn", f"Falha ao transcrever um trecho (ignorado): {e}")
+            self._handle_transcribe_error(e, engine)
+
+    def _handle_transcribe_error(self, e, engine):
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        body = ""
+        try:
+            body = (e.response.text or "").lower()
+        except Exception:
+            pass
+        quota = "insufficient_quota" in body or "exceeded your current quota" in body
+        if engine == ENGINE_OPENAI and status in (401, 403):
+            self.stop_event.set()
+            self._post("error", f"Chave da OpenAI recusada (HTTP {status}). "
+                                f"Ajuste a chave em ⚙ Configurações e tente novamente.")
+        elif engine == ENGINE_OPENAI and status == 429 and quota:
+            self.stop_event.set()
+            self._post("error", "Sua conta OpenAI está SEM CRÉDITOS/COTA (HTTP 429).\n\n"
+                                "Adicione créditos em:\n"
+                                "https://platform.openai.com/settings/organization/billing\n\n"
+                                "Ou use o motor 'Local' (grátis) — de preferência com a GPU "
+                                "(Executar-GPU.bat + modelo large-v3-turbo).")
+        elif engine == ENGINE_OPENAI and status == 429:
+            self._post("warn", "OpenAI: limite de requisições (429). Reduzindo o ritmo...")
+            time.sleep(5)
+        elif engine == ENGINE_OPENAI:
+            self._post("warn", f"Falha na API OpenAI (trecho ignorado): {e}")
+        else:
+            self._post("warn", f"Falha ao transcrever um trecho (ignorado): {e}")
 
     # ------------------------------------------------------- comunicação UI --
     def _post(self, kind, payload):
@@ -1116,7 +1122,7 @@ class TranscricaoApp:
                 except queue.Empty:
                     break
                 try:
-                    if kind == "text":
+                    if kind == "line":
                         self._append_text(payload)
                     elif kind in ("status", "warn"):
                         self._set_status(payload)
@@ -1139,9 +1145,11 @@ class TranscricaoApp:
             except Exception:
                 pass
 
-    def _append_text(self, text):
+    def _append_text(self, block):
         at_end = self.text.yview()[1] >= 0.999
-        self.text.insert("end", text + " ")
+        if self.text.index("end-1c") != "1.0":   # já há conteúdo -> separa parágrafos
+            self.text.insert("end", "\n\n")
+        self.text.insert("end", block)
         if at_end:
             self.text.see("end")
 
@@ -1163,7 +1171,7 @@ class TranscricaoApp:
         self.cfg.update({"theme": self.theme_name, "mode": self.mode_var.get(),
                          "model": self.model_var.get(), "engine": self.engine,
                          "openai_key": self.openai_key, "openai_model": self.openai_model,
-                         "vocab": self.vocab})
+                         "vocab": self.vocab, "timestamps": self.show_timestamps})
         save_config(self.cfg)
         self.stop_event.set()
         threads_done = True

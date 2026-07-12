@@ -10,8 +10,13 @@ Captura em **3 modos** (selecionáveis na tela):
 1. **🎤 Microfone** — a entrada padrão (ou qualquer microfone escolhido)
 2. **🔊 Sistema** — o áudio que está tocando no PC (WASAPI *loopback* via
    `PyAudioWPatch`): reuniões, vídeos, chamadas, etc.
-3. **🎤+🔊 Ambos** — mistura microfone **e** áudio do sistema num só texto
-   (ideal para transcrever uma reunião inteira: você + os outros)
+3. **🎤+🔊 Ambos** — transcreve microfone **e** áudio do sistema em paralelo e
+   **rotula cada fala** (`🎤 Você` x `🔊 Outros`), separando você dos outros
+   participantes (ideal para reuniões/chamadas).
+
+A saída sai **organizada em parágrafos** (um trecho por pausa), com **uma frase
+por linha** e o **horário** `[hh:mm]` no começo de cada trecho (pode desligar em
+⚙ Configurações).
 
 A transcrição roda em **tempo real**, em blocos de ~5 s, numa **thread separada**
 (a interface não trava), e usa **GPU NVIDIA (CUDA)** automaticamente quando
@@ -120,8 +125,16 @@ Se quiser a melhor precisão sem depender do seu PC, use o motor **OpenAI**
 2. No app: **⚙ Configurações** → marque **OpenAI (nuvem)** → cole a chave no
    campo **"Chave da API OpenAI"** → escolha o modelo → **Salvar**.
    - Modelos: `gpt-4o-mini-transcribe` (barato e ótimo — padrão),
-     `gpt-4o-transcribe` (melhor), `whisper-1` (clássico).
+     `gpt-4o-transcribe` (melhor), `whisper-1` (clássico), e
+     **`gpt-4o-transcribe-diarize`** (que **separa os falantes**, rotulando
+     `🗣 Falante 1`, `🗣 Falante 2`… — útil para transmissões/entrevistas com
+     várias pessoas numa fonte só).
    - A chave fica salva em `%USERPROFILE%\.transcricao_audio.json` (texto puro).
+
+> **Separar falantes numa fonte única** (ex.: uma transmissão com narrador +
+> comentarista): isso exige *diarização*. A forma pronta aqui é o modelo
+> `gpt-4o-transcribe-diarize` (OpenAI, precisa de créditos). No modo **Ambos**,
+> a separação você-x-outros já é feita localmente e de graça.
 3. **Alternativa (sem salvar no disco):** defina a variável de ambiente
    `OPENAI_API_KEY` antes de abrir o app. Ex. no PowerShell:
    ```powershell
