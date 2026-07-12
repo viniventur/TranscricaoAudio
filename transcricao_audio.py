@@ -1076,11 +1076,29 @@ class TranscricaoApp:
                 self._post("text", text)
         except Exception as e:
             status = getattr(getattr(e, "response", None), "status_code", None)
+            body = ""
+            try:
+                body = (e.response.text or "").lower()
+            except Exception:
+                pass
+            quota = "insufficient_quota" in body or "exceeded your current quota" in body
             if engine == ENGINE_OPENAI and status in (401, 403):
                 # Chave inválida: não adianta continuar tentando. Encerra e avisa.
                 self.stop_event.set()
                 self._post("error", f"Chave da OpenAI recusada (HTTP {status}). "
                                     f"Ajuste a chave em ⚙ Configurações e tente novamente.")
+            elif engine == ENGINE_OPENAI and status == 429 and quota:
+                # Conta sem créditos/cota: não adianta insistir. Encerra e explica.
+                self.stop_event.set()
+                self._post("error", "Sua conta OpenAI está SEM CRÉDITOS/COTA (HTTP 429).\n\n"
+                                    "Adicione créditos em:\n"
+                                    "https://platform.openai.com/settings/organization/billing\n\n"
+                                    "Ou use o motor 'Local' (grátis) — de preferência com a GPU "
+                                    "(Executar-GPU.bat + modelo large-v3-turbo).")
+            elif engine == ENGINE_OPENAI and status == 429:
+                # Limite de requisições por minuto: espera um pouco e segue.
+                self._post("warn", "OpenAI: limite de requisições (429). Reduzindo o ritmo...")
+                time.sleep(5)
             elif engine == ENGINE_OPENAI:
                 self._post("warn", f"Falha na API OpenAI (trecho ignorado): {e}")
             else:
