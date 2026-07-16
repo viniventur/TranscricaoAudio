@@ -28,6 +28,7 @@ _packages = [
     "pyaudiowpatch",    # captura de áudio (mic + WASAPI loopback)
     "httpx",            # chamadas à API da OpenAI (motor opcional em nuvem)
     "certifi",          # bundle de certificados p/ HTTPS (OpenAI)
+    "sherpa_onnx",      # identificação de falantes por voz (DLLs nativas em lib/)
 ]
 
 datas, binaries, hiddenimports = [], [], []
@@ -39,6 +40,18 @@ for _pkg in _packages:
 
 # Extensão C de nível superior do PyAudioWPatch (importada como _portaudiowpatch).
 hiddenimports += ["_portaudiowpatch"]
+
+# Modelo de embedding de voz (CAM++ ONNX, ~28 MB) EMBUTIDO no exe -> a
+# identificação de falantes funciona offline desde a 1ª execução. Baixe o
+# arquivo antes do build com:  venv\Scripts\python.exe baixar_modelo_voz.py
+import os as _os
+_speaker_model = _os.path.join("assets", "speaker_campplus.onnx")
+if _os.path.isfile(_speaker_model):
+    datas += [(_speaker_model, "assets")]
+else:
+    raise SystemExit(
+        "Modelo de voz ausente: " + _speaker_model + "\n"
+        "Rode antes do build:  venv\\Scripts\\python.exe baixar_modelo_voz.py")
 
 
 a = Analysis(

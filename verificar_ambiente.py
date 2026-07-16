@@ -26,6 +26,21 @@ def main():
     print(f"faster_whisper  : {faster_whisper.__version__}")
     print(f"pyaudiowpatch   : {pyaudio.__version__}")
 
+    # Identificação de falantes por voz (opcional)
+    import os
+    try:
+        import sherpa_onnx
+        print(f"sherpa_onnx     : {sherpa_onnx.__version__} (identificação de voz OK)")
+    except Exception as e:
+        print(f"sherpa_onnx     : AUSENTE ({e.__class__.__name__}) — sem identificação de voz")
+    _model = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "assets", "speaker_campplus.onnx")
+    if os.path.isfile(_model):
+        print(f"modelo de voz   : embutível ({os.path.getsize(_model) / 1e6:.1f} MB em assets/)")
+    else:
+        print("modelo de voz   : ausente em assets/ (será baixado na 1ª vez; "
+              "para embutir no .exe rode baixar_modelo_voz.py)")
+
     # --- API do PyAudioWPatch (loopback) -----------------------------------
     print("-" * 60)
     print("API PyAudioWPatch:")

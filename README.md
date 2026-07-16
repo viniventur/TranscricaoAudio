@@ -94,9 +94,11 @@ Na janela:
 5. **■ Parar** — encerra (processa os últimos trechos antes de parar).
 6. **🧹 Limpar** — apaga o texto.
 7. **💾 Salvar .txt** — grava a transcrição em um arquivo de texto (UTF-8).
-8. **☀/🌙 (canto superior direito)** — alterna entre tema claro e escuro.
-9. **⚙ Configurações** — motor (Local ou OpenAI), chave da API, e o campo de
-   **vocabulário/contexto** (veja abaixo).
+8. **🧑‍🤝‍🧑 Identificar vozes** — cadastra a voz de cada pessoa para rotular os
+   trechos com o **nome real** (veja abaixo).
+9. **☀/🌙 (canto superior direito)** — alterna entre tema claro e escuro.
+10. **⚙ Configurações** — motor (Local ou OpenAI), chave da API, identificação de
+    falantes, e o campo de **vocabulário/contexto** (veja abaixo).
 
 ### 🎯 Como conseguir a MELHOR qualidade
 
@@ -141,6 +143,40 @@ Se quiser a melhor precisão sem depender do seu PC, use o motor **OpenAI**
    setx OPENAI_API_KEY "sk-suachave"
    ```
    (feche e reabra o terminal/app depois do `setx`).
+
+### 🧑‍🤝‍🧑 Identificar falantes por voz (nomes reais, offline)
+
+Em vez de `Falante 1/2`, o app pode rotular cada trecho com o **nome real** de
+quem falou. Você **cadastra a voz** de cada pessoa uma vez e ele reconhece
+depois — **100% local** (usa um modelo de "impressão vocal" de ~28 MB; nenhum
+áudio sai do PC no motor Local).
+
+**Como usar:**
+1. Clique em **🧑‍🤝‍🧑 Identificar vozes**.
+2. Escolha a **fonte** (🎤 Microfone ou 🔊 Sistema — a mesma em que a pessoa será
+   ouvida), digite o **nome** e clique **● Gravar 12 s**. A pessoa fala
+   naturalmente enquanto grava. Repita para cada participante.
+3. Em **⚙ Configurações**, marque **"Identificar falantes por voz"**. (Opcional:
+   preencha **"Seu nome"** — no modo **Ambos**, seu microfone é rotulado com ele
+   automaticamente, sem depender de reconhecimento.)
+4. **▶ Iniciar** normalmente. Os trechos saem como `Maria:`, `João:`… Quando
+   ninguém bate com confiança suficiente, o rótulo vira **`Desconhecido`** (não
+   chuta um nome errado).
+
+Funciona nos dois motores: no **Local** e no **OpenAI**. No modelo
+`gpt-4o-transcribe-diarize`, as gravações de cadastro são enviadas como
+*referências* (até **4** pessoas) e a própria OpenAI devolve os nomes reais.
+
+**Limites honestos:** é um recurso assistivo, não perícia. Espere ~80–90% de
+acerto com **2–5 vozes distintas**, em conversa com turnos e áudio bom. Cai com
+**fala curta** (< ~3 s), **duas pessoas falando ao mesmo tempo** (o trecho vira
+um rótulo só) e **vozes muito parecidas**. Dica: **cadastre cada pessoa na mesma
+fonte** em que ela será ouvida (cadastrar no microfone e identificar numa chamada
+comprimida piora bastante).
+
+> 🔒 **Privacidade/LGPD:** perfis de voz são dados biométricos. Ficam **só no seu
+> PC** em `%USERPROFILE%\.transcricao_audio_voices\` e podem ser removidos por
+> pessoa na própria janela de cadastro.
 
 ### ⚠️ Primeira execução: download do modelo
 

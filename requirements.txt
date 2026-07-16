@@ -22,3 +22,7 @@ PyAudioWPatch==0.2.12.8
 
 # Processamento de áudio (conversão/reamostragem)
 numpy==2.5.1
+
+# Identificação de falantes por voz (embeddings), 100% offline, sem PyTorch.
+# Traz o runtime nativo + extração de features Kaldi correta. Tem wheel cp314.
+sherpa-onnx==1.13.4

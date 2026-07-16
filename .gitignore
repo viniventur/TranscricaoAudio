@@ -17,3 +17,6 @@ __pycache__/
 
 # Modelos baixados (ficam no cache do usuário, não no projeto)
 models/
+
+# Modelo de voz (~28 MB) — baixado com baixar_modelo_voz.py, não versionado
+assets/*.onnx
