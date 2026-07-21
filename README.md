@@ -111,9 +111,9 @@ A qualidade depende, em ordem de impacto:
 2. **Preencha o Vocabulário/contexto** (⚙ Configurações): liste nomes, siglas e
    jargões do seu conteúdo (ex.: `Pridvê, MoCap, back-end, deploy, Lucas`). O
    modelo passa a acertar essas palavras.
-3. **Corte em pausas (automático).** O app agora acumula o áudio e só transcreve
-   ao detectar uma **pausa** (ou a cada ~15 s), mantendo o **contexto** entre
-   trechos — muito melhor que blocos fixos curtos.
+3. **Corte em pausas (automático).** O app acumula o áudio e só transcreve ao
+   detectar uma **pausa** (ou a cada ~15 s) — muito melhor que blocos fixos
+   curtos. Trechos em silêncio são **ignorados**, evitando texto inventado.
 4. **Prefira "Microfone" ou "Sistema" a "Ambos"** quando possível. Misturar as
    duas fontes com falas sobrepostas atrapalha o reconhecimento.
 
@@ -265,9 +265,19 @@ pyinstaller --noconfirm --onefile --windowed --name TranscricaoAudio --collect-a
 - **Segmentação por pausa (não por blocos fixos):** o áudio é acumulado e só
   transcrito ao detectar um **silêncio** (pausa natural) ou ao atingir ~15 s.
   Assim os cortes caem em pausas, não no meio de palavras. Cada trecho é
-  transcrito com `beam_size=5`, `best_of=5`, `condition_on_previous_text=True`
-  e um `initial_prompt` (vocabulário do usuário + fim do texto anterior), o que
-  melhora muito nomes/jargão e a continuidade.
+  transcrito com `beam_size=5`, `best_of=5` e um `initial_prompt` **só com o
+  vocabulário** do usuário (limitado a ~200 caracteres).
+- **Anti-alucinação / anti-repetição (importante):** o Whisper tende a *inventar*
+  texto em silêncio/ruído e a *repetir* falas em loop. Defesas em camadas:
+  1. **Portão de silêncio:** blocos praticamente sem voz **não** vão ao modelo.
+  2. `condition_on_previous_text=False` e o texto já transcrito **não** é
+     reinjetado como prompt — era isso que fazia o modelo **ecoar e acumular**
+     as falas a cada bloco (o bug das frases duplicando).
+  3. `no_repeat_ngram_size=3` + `repetition_penalty=1.1` barram repetições
+     dentro do bloco; `VAD` (Silero) + `no_speech_threshold` filtram trechos sem
+     fala; segmentos com forte cara de ruído/degeneração são descartados.
+  4. Pós-processamento colapsa repetições degeneradas remanescentes,
+     **preservando** ditado numérico ("cinco cinco cinco") e a fala normal.
 - **Motores:** `local` (faster-whisper, offline) ou `openai` (API na nuvem —
   `gpt-4o-mini-transcribe`/`gpt-4o-transcribe`/`whisper-1`), selecionável em
   ⚙ Configurações.

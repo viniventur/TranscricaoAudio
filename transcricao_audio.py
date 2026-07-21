@@ -57,6 +57,11 @@ CAPTURE_SECONDS = 1.0          # a captura entrega blocos curtos de ~1s...
 MIN_FLUSH_SECONDS = 5.0
 MAX_FLUSH_SECONDS = 15.0
 SILENCE_RMS = 0.012            # abaixo disso o trecho é considerado "pausa"
+MIN_VOICED_SECONDS = 0.15      # bloco com menos voz que isso é "silêncio" e NÃO
+                               # vai ao modelo (corta alucinação/eco em silêncio).
+                               # Baixo de propósito: um bloco 100% mudo pontua 0.0
+                               # e é cortado, mas monossílabos reais ("Sim.",
+                               # "Né?", ~150-300 ms) ainda passam.
 CONTEXT_TAIL_CHARS = 220       # contexto passado ao modelo entre blocos
 MAX_BACKLOG_SECONDS = 90       # teto da fila; acima disso descarta o mais antigo
 
@@ -102,7 +107,7 @@ SPEAKER_DIM = 192
 VOICES_DIR = os.path.join(os.path.expanduser("~"), ".transcricao_audio_voices")
 SPKR_THRESHOLD = 0.5           # limiar de cosseno p/ aceitar a identidade (0..1)
 SPKR_ENROLL_SECONDS = 12.0     # duração da gravação de cadastro por pessoa
-SPKR_MIN_ID_SECONDS = 2.5      # trechos mais curtos que isso não são identificados
+SPKR_MIN_ID_SECONDS = 1.5      # trechos mais curtos que isso não são identificados
 SPKR_MIN_ENROLL_SECONDS = 3.0  # mínimo de voz p/ aceitar um cadastro
 SPKR_REF_MAX_SECONDS = 9.0     # clipe de referência p/ OpenAI (limite oficial: 2–10 s)
 UNKNOWN_SPEAKER = "Desconhecido"
@@ -280,6 +285,51 @@ def trim_to_voiced(audio16k, max_seconds=None, frame_ms=30):
         if clip.size > cap:
             clip = clip[:cap]
     return clip.astype(np.float32, copy=False)
+
+
+def voiced_seconds(audio16k, frame_ms=30):
+    """Quantidade de áudio (em segundos) COM voz — janelas de ~30 ms cujo RMS
+    passa do limiar de silêncio. É o medidor do "portão de silêncio": diferente
+    de trim_to_voiced (que devolve o buffer inteiro quando NADA tem voz), aqui um
+    bloco totalmente silencioso resulta em 0.0 e é descartado antes do modelo."""
+    if audio16k is None or audio16k.size == 0:
+        return 0.0
+    win = max(1, int(TARGET_RATE * frame_ms / 1000))
+    n = sum(1 for i in range(0, audio16k.size, win)
+            if rms(audio16k[i:i + win]) >= SILENCE_RMS)
+    return n * win / float(TARGET_RATE)
+
+
+def collapse_repeats(text):
+    """Colapsa as repetições degeneradas que o Whisper produz em silêncio/ruído
+    (ex.: "Doğru. Doğru. Doğru." ou uma frase inteira repetida dezenas de vezes),
+    preservando a fala normal — inclusive uma repetição dupla legítima ("sim, sim").
+
+    1) "corridas" de uma MESMA palavra: mantém no máximo 3 seguidas — preserva
+       ditado numérico legítimo ("cinco cinco cinco" de um código/telefone/placar),
+       pois a degeneração do Whisper repete dezenas de vezes (3 já colapsa o lixo);
+    2) sentenças idênticas consecutivas: reduz para uma só ocorrência.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    out, run = [], 0
+    for w in text.split():
+        if out and w.lower() == out[-1].lower():
+            run += 1
+        else:
+            run = 0
+        if run >= 3:          # já há 3 iguais em sequência -> descarta o excedente
+            continue
+        out.append(w)
+    text = " ".join(out)
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?…])\s+", text) if s.strip()]
+    dedup = []
+    for s in sentences:
+        if dedup and s.lower() == dedup[-1].lower():
+            continue
+        dedup.append(s)
+    return " ".join(dedup).strip()
 
 
 class SpeakerBank:
@@ -462,9 +512,16 @@ class SpeakerBank:
         emb = self._embed(clip)
         if emb is None:
             return ""
+        # Limiar sobe para clipes curtos: os embeddings CAM++ ficam menos
+        # confiáveis abaixo de ~2.5 s, então exigimos mais similaridade para
+        # não TROCAR nomes entre pessoas cadastradas. Acima disso, usa o limiar
+        # base (nunca abaixamos o piso — isso só aumentaria falsos positivos).
+        thr = float(self.threshold)
+        if clip.size < int(TARGET_RATE * 2.5):
+            thr = max(thr, 0.55)
         try:
             with self._lock:
-                return self._mgr.search(emb.tolist(), float(self.threshold)) or ""
+                return self._mgr.search(emb.tolist(), thr) or ""
         except Exception:
             return ""
 
@@ -1533,7 +1590,7 @@ class TranscricaoApp:
             cap.start()
             self.all_threads.append(cap)
             return {"q": q, "base_label": base_label, "identify": identify,
-                    "buf": [], "secs": 0.0, "tail": ""}
+                    "buf": [], "secs": 0.0, "tail": "", "last_text": ""}
 
         streams = []
         if mode == MODE_MIC:
@@ -1681,6 +1738,9 @@ class TranscricaoApp:
                 # Com referências cadastradas, o "speaker" já vem como o NOME real.
                 known = self._known_refs if st.get("identify") else None
                 for speaker, text in openai_diarize(audio16k, self._openai_key(), known):
+                    text = collapse_repeats(text)
+                    if not text:
+                        continue
                     if known:
                         label = speaker                      # já é o nome real
                     elif st.get("base_label"):
@@ -1689,21 +1749,96 @@ class TranscricaoApp:
                         label = f"🗣 Falante {speaker}"
                     self._emit_line(label, text)
                 return
+
+            # Portão de silêncio: blocos praticamente sem voz NÃO vão ao modelo.
+            # Corta na raiz as alucinações em silêncio ("Doğru." repetido) e o eco
+            # de prompt que duplicava/acumulava as falas — e ainda evita gasto de
+            # CPU/API. O trecho enviado é recortado (sem silêncio nas bordas).
+            vs = voiced_seconds(audio16k)
+            if vs < MIN_VOICED_SECONDS:
+                return
+            voiced = trim_to_voiced(audio16k)
+            if voiced.size == 0:
+                return
+
             if engine == ENGINE_OPENAI:
-                text = openai_transcribe(audio16k, self._openai_key(),
+                text = openai_transcribe(voiced, self._openai_key(),
                                          self.openai_model, self._build_prompt(st["tail"]))
             else:
-                prompt = self._build_prompt(st["tail"])
-                segments, _ = self.model.transcribe(
-                    audio16k, language=LANGUAGE, beam_size=5, best_of=5,
-                    vad_filter=True, vad_parameters={"min_silence_duration_ms": 400},
-                    condition_on_previous_text=True, initial_prompt=prompt or None)
-                text = " ".join(seg.text.strip() for seg in segments).strip()
-            if text:
-                st["tail"] = (st["tail"] + " " + text)[-CONTEXT_TAIL_CHARS:]
-                self._emit_line(self._resolve_label(st, audio16k), text)
+                text = self._transcribe_local(voiced)
+            text = collapse_repeats(text)
+            if not text:
+                return
+            # Bloco "suspeito" = pouca voz real (borderline). As redes anti-eco
+            # mais agressivas rodam SÓ aqui, para NUNCA engolir uma repetição real
+            # e alta ("Está me ouvindo? Está me ouvindo?", que tem bastante voz):
+            #   • eco de vocabulário: o modelo regurgita o initial_prompt;
+            #   • duplicação entre blocos: repete exatamente o trecho anterior.
+            suspicious = vs < 1.5
+            if suspicious and self._looks_like_vocab_echo(text):
+                return
+            last = (st.get("last_text") or "").strip().lower()
+            if suspicious and text.strip().lower() == last and len(text) >= 12:
+                return
+            st["last_text"] = text
+            st["tail"] = (st["tail"] + " " + text)[-CONTEXT_TAIL_CHARS:]
+            self._emit_line(self._resolve_label(st, voiced), text)
         except Exception as e:
             self._handle_transcribe_error(e, engine)
+
+    def _transcribe_local(self, audio16k):
+        """Transcreve um trecho no faster-whisper com defesas anti-alucinação.
+
+        Mudança-chave vs. a versão anterior: o texto já transcrito NÃO é mais
+        reinjetado como prompt e condition_on_previous_text=False. Reinjetar o
+        histórico fazia o modelo, em silêncio, ECOAR e ACUMULAR esse texto (loop
+        que crescia a cada bloco). Só o vocabulário do usuário entra como
+        contexto. no_repeat_ngram_size/repetition_penalty barram repetições dentro
+        do bloco; os thresholds + VAD filtram trechos sem fala."""
+        # Vocabulário limitado a ~200 chars: um initial_prompt longo pode ser
+        # "ecoado" literalmente pelo modelo em áudio de baixo conteúdo.
+        prompt = self._build_prompt("")   # vocabulário do usuário apenas
+        if len(prompt) > 200:
+            prompt = prompt[:200].rsplit(" ", 1)[0]
+        segments, _ = self.model.transcribe(
+            audio16k, language=LANGUAGE, beam_size=5, best_of=5,
+            no_repeat_ngram_size=3, repetition_penalty=1.1,
+            compression_ratio_threshold=2.4, log_prob_threshold=-1.0,
+            no_speech_threshold=0.6, condition_on_previous_text=False,
+            initial_prompt=prompt or None, vad_filter=True,
+            vad_parameters={"threshold": 0.5, "min_speech_duration_ms": 250,
+                            "min_silence_duration_ms": 500, "speech_pad_ms": 300})
+        parts = []
+        for seg in segments:
+            s = (seg.text or "").strip()
+            if not s:
+                continue
+            # Descarta segmentos com forte cara de silêncio/alucinação ou de
+            # texto degenerado (repetitivo). Em ambos exigimos DUAS condições
+            # (a 2ª sendo baixa confiança) p/ não cortar fala real densa/baixa:
+            #   • no_speech alto E avg_logprob ruim  -> silêncio/ruído;
+            #   • compression_ratio alto E avg_logprob ruim -> repetição degenerada
+            #     (o compression_ratio_threshold=2.4 do próprio Whisper já faz o
+            #     fallback de temperatura antes; fala densa legítima chega a ~2.4-2.8
+            #     mas com boa confiança, então não é cortada aqui).
+            if seg.no_speech_prob >= 0.90 and seg.avg_logprob <= -0.7:
+                continue
+            if seg.compression_ratio >= 2.6 and seg.avg_logprob <= -0.5:
+                continue
+            parts.append(s)
+        return " ".join(parts).strip()
+
+    def _looks_like_vocab_echo(self, text):
+        """True se o trecho parece ser só o VOCABULÁRIO sendo regurgitado pelo
+        modelo (eco do initial_prompt em áudio de baixo conteúdo). Exige um
+        tamanho mínimo p/ não confundir com uma menção real e curta a um termo
+        do vocabulário (ex.: alguém realmente diz "Reason Solutions")."""
+        vocab = (self.vocab or "").strip().lower()
+        if not vocab:
+            return False
+        norm = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", text.lower())).strip()
+        vnorm = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", vocab)).strip()
+        return len(norm) >= 25 and norm in vnorm
 
     def _resolve_label(self, st, audio16k):
         """Rótulo do trecho: nome identificado por voz (quando ligado e há perfis)
